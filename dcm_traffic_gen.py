@@ -162,7 +162,12 @@ class CounterState:
         self.topo       = topo
         self.rng        = np.random.default_rng(seed)
         self.cumulative = np.zeros((n, 6), dtype=np.uint64)
-        self.last_ts    = np.full(n, time.time(), dtype=np.float64)
+        # Seed last_ts one full collection interval in the past so the very
+        # first visit to every series yields a realistic, non-zero counter
+        # delta (≈ COLLECTION_INTERVAL seconds worth of traffic).
+        # Without this, batch-0 has elapsed ≈ 0 → all deltas ≈ 0.
+        self.last_ts = np.full(n, time.time() - COLLECTION_INTERVAL,
+                               dtype=np.float64)
 
     @staticmethod
     def diurnal_factor(ts: float) -> float:
@@ -473,10 +478,19 @@ def main() -> None:
     n_interfaces = max(1, int(FULL_INTERFACES * args.scale))
     target_rate  = args.rate if args.rate > 0 else FULL_TARGET_RATE * args.scale
 
+    n_series     = max(1, int(FULL_INTERFACES * args.scale)) * len(QOS_CLASSES) * len(DIRECTIONS)
+    revisit_secs = n_series / target_rate
+    min_duration = int(revisit_secs * 2)    # 2 laps minimum for rate() to work
+
     print(f"\nDCM Traffic Generator")
     print(f"  Scale            : {args.scale:.4f}  ({n_interfaces:,} interfaces)")
     print(f"  Target rate      : {target_rate:,.0f} rows/sec")
-    print(f"  Duration         : {'∞' if args.duration <= 0 else f'{args.duration} s'}")
+    print(f"  Series           : {n_series:,}")
+    print(f"  Series revisit   : {revisit_secs:.0f} s")
+    dur_str = '∞' if args.duration <= 0 else f'{args.duration} s'
+    if 0 < args.duration < min_duration:
+        dur_str += f"  ⚠ too short — need ≥{min_duration} s for rate() graphs (2 full laps)"
+    print(f"  Duration         : {dur_str}")
     print(f"  Metric prefix    : {args.table}_*")
     print(f"  Endpoint         : {args.prometheus_url[:72]}{'…' if len(args.prometheus_url) > 72 else ''}")
 

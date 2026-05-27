@@ -13,13 +13,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY dcm_traffic_gen.py .
 
 # ── Config — all overridable at docker run with -e ────────────────────────────
-ENV PROMETHEUS_URL=""
+ENV PORT=8000
 ENV SCALE=0.01
-ENV DURATION=300
+ENV DURATION=0
 ENV RATE=0
 ENV BATCH=500
 ENV TABLE=dcm_telemetry
 ENV SEED=42
-ENV NO_PING=false
+
+EXPOSE 8000
 
 ENTRYPOINT ["python", "-u", "dcm_traffic_gen.py"]

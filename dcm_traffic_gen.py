@@ -1,57 +1,56 @@
 #!/usr/bin/env python3
 """
-dcm_traffic_gen.py  —  DCM Traffic Generator
+dcm_traffic_gen.py — DCM Traffic Generator (Prometheus scrape-endpoint mode)
 
-Simulates the steady-state telemetry workload produced by many distributed
-collectors, each running on their own 5-min interval.  The net effect in the
-field is a smoothed, constant stream rather than periodic bursts.
+Exposes QoS counter metrics on a /metrics HTTP endpoint for scraping by any
+Prometheus-compatible collector (FFWD Universal Collector, Prometheus,
+Grafana Agent, etc.).
 
-Sends data via Prometheus remote write (protobuf + Snappy) to any compatible
-endpoint: VictoriaMetrics, Grafana Cloud, Thanos, custom ingest APIs, etc.
+Models a fleet of network interfaces (1–400 Gbps), 8 QoS traffic classes,
+2 directions, and 6 counter columns per series — with realistic sparsity,
+diurnal load variation, and ±3 % traffic noise.
 
 ─────────────────────────────────────────────────────────────────────────────
 USAGE (Docker — recommended)
 ─────────────────────────────────────────────────────────────────────────────
-    docker run --rm \\
-      -e PROMETHEUS_URL="https://example.com/write/TOKEN?key=KEY" \\
+    docker run --rm -p 8000:8000 \\
       -e SCALE=0.01 \\
-      -e DURATION=300 \\
       ghcr.io/ys1173/dcm-traffic-gen:latest
 
 ─────────────────────────────────────────────────────────────────────────────
 USAGE (CLI)
 ─────────────────────────────────────────────────────────────────────────────
-    python dcm_traffic_gen.py \\
-        --prometheus-url "https://..." \\
-        --scale 0.01 --duration 60
+    python dcm_traffic_gen.py --scale 0.01
+
+Point your collector at:  http://<host>:8000/metrics
 
 ─────────────────────────────────────────────────────────────────────────────
 ENVIRONMENT VARIABLES
 ─────────────────────────────────────────────────────────────────────────────
-  PROMETHEUS_URL    Full remote write URL incl. auth params   (required)
-  SCALE             Fraction of full 250K-interface workload  (default: 0.01)
-  DURATION          Run duration in seconds; 0 = run forever  (default: 300)
-  RATE              Rows/sec override; 0 = SCALE × 21,000    (default: 0)
-  BATCH             Rows per HTTP POST                        (default: 500)
-  TABLE             Metric name prefix                        (default: dcm_telemetry)
-  SEED              Topology random seed (reproducibility)    (default: 42)
-  NO_PING           Skip endpoint reachability check          (default: false)
+  PORT        HTTP port to expose /metrics on           (default: 8000)
+  SCALE       Fraction of full 250K-interface workload  (default: 0.01)
+  DURATION    Run duration in seconds; 0 = run forever  (default: 0)
+  RATE        Series updates/sec; 0 = auto              (default: 0)
+  BATCH       Series updated per tick                   (default: 500)
+  TABLE       Metric name prefix                        (default: dcm_telemetry)
+  SEED        Topology random seed (reproducibility)    (default: 42)
 
 ─────────────────────────────────────────────────────────────────────────────
 SCALE MAP  (250 K interfaces × 8 QoS × 2 directions)
 ─────────────────────────────────────────────────────────────────────────────
-  SCALE=0.001  →    250 interfaces,    4,000 series,    ~21 rows/sec
-  SCALE=0.01   →  2,500 interfaces,   40,000 series,   ~210 rows/sec
-  SCALE=0.10   → 25,000 interfaces,  400,000 series, ~2,100 rows/sec
-  SCALE=1.00   →250,000 interfaces,4,000,000 series,~21,000 rows/sec
+  SCALE=0.001  →    250 interfaces,    4,000 series
+  SCALE=0.01   →  2,500 interfaces,   40,000 series
+  SCALE=0.10   → 25,000 interfaces,  400,000 series
+  SCALE=1.00   →250,000 interfaces,4,000,000 series
+
 ─────────────────────────────────────────────────────────────────────────────
-METRICS EMITTED  (6 per series)
+METRICS EMITTED  (6 per series, TYPE counter)
 ─────────────────────────────────────────────────────────────────────────────
   <TABLE>_match_bytes     <TABLE>_match_packets
   <TABLE>_trans_bytes     <TABLE>_trans_packets
   <TABLE>_drop_bytes      <TABLE>_drop_packets
 
-  Labels: __name__, direction, host, interface, qos_class
+  Labels: direction, host, interface, qos_class
 """
 
 from __future__ import annotations
@@ -59,26 +58,19 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import struct
 import sys
 import time
-from typing import Union
 
 import numpy as np
-import requests
+from prometheus_client import Counter, start_http_server
 
-try:
-    import snappy as _snappy
-    _HAS_SNAPPY = True
-except ImportError:
-    _HAS_SNAPPY = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
 FULL_INTERFACES  = 250_000
-FULL_TARGET_RATE = 21_000          # rows/sec at scale 1.0
+FULL_TARGET_RATE = 21_000          # series/sec at scale 1.0
 
 QOS_CLASSES = [
     "TC1", "TC2", "TC3", "TC4", "TC5", "TC6", "TC7", "class-default"
@@ -112,7 +104,9 @@ METRIC_COLS = [
     "drop_packets",  "drop_bytes",
 ]
 
-COLLECTION_INTERVAL = 300   # seconds
+COLLECTION_INTERVAL = 300   # seconds (simulated router polling interval)
+
+LABEL_NAMES = ["direction", "host", "interface", "qos_class"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,26 +122,28 @@ def build_topology(n_interfaces: int, seed: int = 42) -> dict:
     print(f"[topology] {n_interfaces:,} interfaces "
           f"× {n_qos} QoS × {n_dir} directions = {n_series:,} series")
 
-    tier_probs  = np.array([t[0] for t in BANDWIDTH_TIERS])
-    tier_rates  = np.array([t[1] for t in BANDWIDTH_TIERS], dtype=np.float64)
-    tier_idx    = rng.choice(len(BANDWIDTH_TIERS), size=n_interfaces, p=tier_probs)
-    iface_bw    = tier_rates[tier_idx]
+    tier_probs = np.array([t[0] for t in BANDWIDTH_TIERS])
+    tier_rates = np.array([t[1] for t in BANDWIDTH_TIERS], dtype=np.float64)
+    tier_idx   = rng.choice(len(BANDWIDTH_TIERS), size=n_interfaces, p=tier_probs)
+    iface_bw   = tier_rates[tier_idx]
 
-    iface_idx   = np.repeat(np.arange(n_interfaces), n_qos * n_dir)
-    qos_idx     = np.tile(np.repeat(np.arange(n_qos), n_dir), n_interfaces)
-    dir_idx     = np.tile(np.arange(n_dir), n_interfaces * n_qos)
+    iface_idx  = np.repeat(np.arange(n_interfaces), n_qos * n_dir)
+    qos_idx    = np.tile(np.repeat(np.arange(n_qos), n_dir), n_interfaces)
+    dir_idx    = np.tile(np.arange(n_dir), n_interfaces * n_qos)
 
     assert abs(QOS_SPLIT.sum() - 1.0) < 1e-9
-    series_bw   = iface_bw[iface_idx] * QOS_SPLIT[qos_idx]
-    series_bw  *= rng.uniform(0.40, 0.90, size=n_series)
+    series_bw  = iface_bw[iface_idx] * QOS_SPLIT[qos_idx]
+    series_bw *= rng.uniform(0.40, 0.90, size=n_series)
 
     sparsity_p    = np.array([QOS_SPARSITY[QOS_CLASSES[q]] for q in qos_idx])
     shuffle_order = rng.permutation(n_series)
 
-    return dict(n_series=n_series, n_interfaces=n_interfaces,
-                iface_idx=iface_idx, qos_idx=qos_idx, dir_idx=dir_idx,
-                series_bw=series_bw, sparsity_p=sparsity_p,
-                shuffle_order=shuffle_order)
+    return dict(
+        n_series=n_series, n_interfaces=n_interfaces,
+        iface_idx=iface_idx, qos_idx=qos_idx, dir_idx=dir_idx,
+        series_bw=series_bw, sparsity_p=sparsity_p,
+        shuffle_order=shuffle_order,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,17 +151,14 @@ def build_topology(n_interfaces: int, seed: int = 42) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CounterState:
-    """Cumulative counters for all series, advanced on each visit."""
+    """Tracks per-series traffic state; returns deltas on each visit."""
 
     def __init__(self, topo: dict, seed: int = 1):
-        n               = topo["n_series"]
-        self.topo       = topo
-        self.rng        = np.random.default_rng(seed)
-        self.cumulative = np.zeros((n, 6), dtype=np.uint64)
+        n           = topo["n_series"]
+        self.topo   = topo
+        self.rng    = np.random.default_rng(seed)
         # Seed last_ts one full collection interval in the past so the very
-        # first visit to every series yields a realistic, non-zero counter
-        # delta (≈ COLLECTION_INTERVAL seconds worth of traffic).
-        # Without this, batch-0 has elapsed ≈ 0 → all deltas ≈ 0.
+        # first visit yields a realistic non-zero delta (≈ 5 min of traffic).
         self.last_ts = np.full(n, time.time() - COLLECTION_INTERVAL,
                                dtype=np.float64)
 
@@ -176,6 +169,7 @@ class CounterState:
         return max(0.30, min(1.00, factor))
 
     def advance_slice(self, indices: np.ndarray, ts_now: float) -> np.ndarray:
+        """Return per-series deltas (shape: len(indices) × 6) and update state."""
         rng     = self.rng
         n       = len(indices)
         elapsed = np.maximum(ts_now - self.last_ts[indices], 0.0)
@@ -188,148 +182,36 @@ class CounterState:
         noise      = 1.0 + rng.uniform(-0.03, 0.03, size=n)
         byte_delta = (bw * elapsed * df * noise * active).astype(np.uint64)
 
-        pkt_size   = np.maximum(rng.integers(500, 1501, size=n, dtype=np.uint64), 1)
-        pkt_delta  = (byte_delta // pkt_size).astype(np.uint64)
-        trans_r    = rng.uniform(0.80, 1.00, size=n)
-        trans_b    = (byte_delta * trans_r).astype(np.uint64)
-        trans_p    = (pkt_delta  * trans_r).astype(np.uint64)
-        drop_b     = byte_delta - trans_b
-        drop_p     = pkt_delta  - trans_p
+        pkt_size  = np.maximum(rng.integers(500, 1501, size=n, dtype=np.uint64), 1)
+        pkt_delta = (byte_delta // pkt_size).astype(np.uint64)
+        trans_r   = rng.uniform(0.80, 1.00, size=n)
+        trans_b   = (byte_delta * trans_r).astype(np.uint64)
+        trans_p   = (pkt_delta  * trans_r).astype(np.uint64)
+        drop_b    = byte_delta - trans_b
+        drop_p    = pkt_delta  - trans_p
 
-        deltas = np.stack(
+        return np.stack(
             [pkt_delta, byte_delta, trans_p, trans_b, drop_p, drop_b], axis=1
         ).astype(np.uint64)
-        self.cumulative[indices] += deltas
-        return self.cumulative[indices].copy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Minimal Protobuf encoder  (no .proto compilation required)
+# Update loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pb_varint(n: int) -> bytes:
-    out = []
-    while True:
-        bits = n & 0x7F;  n >>= 7
-        out.append(bits | (0x80 if n else 0))
-        if not n:
-            break
-    return bytes(out)
-
-def _pb_ld(field: int, data: bytes) -> bytes:
-    return _pb_varint((field << 3) | 2) + _pb_varint(len(data)) + data
-
-def _pb_str(field: int, s: str) -> bytes:
-    return _pb_ld(field, s.encode())
-
-def _pb_double(field: int, v: float) -> bytes:
-    return _pb_varint((field << 3) | 1) + struct.pack('<d', v)
-
-def _pb_int64(field: int, v: int) -> bytes:
-    return _pb_varint((field << 3) | 0) + _pb_varint(v)
-
-def _label(name: str, value: str) -> bytes:
-    return _pb_str(1, name) + _pb_str(2, value)
-
-def _sample(value: float, ts_ms: int) -> bytes:
-    return _pb_double(1, value) + _pb_int64(2, ts_ms)
-
-def _timeseries(labels: list[bytes], sample: bytes) -> bytes:
-    return b"".join(_pb_ld(1, lb) for lb in labels) + _pb_ld(2, sample)
-
-def _write_request(ts_list: list[bytes]) -> bytes:
-    return b"".join(_pb_ld(1, ts) for ts in ts_list)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prometheus Remote Write
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PrometheusWriter:
-    """
-    Sends snappy-compressed WriteRequest batches to a Prometheus remote write
-    endpoint.  Each row produces 6 TimeSeries (one per counter column).
-    Labels are sorted alphabetically as required by Prometheus.
-    """
-
-    HEADERS = {
-        "Content-Type":                      "application/x-protobuf",
-        "Content-Encoding":                  "snappy",
-        "X-Prometheus-Remote-Write-Version": "0.1.0",
-        "User-Agent":                        "dcm-traffic-gen/1.0",
-    }
-
-    def __init__(self, url: str, table: str = "dcm_telemetry"):
-        if not _HAS_SNAPPY:
-            sys.exit("ERROR: python-snappy is required — pip install python-snappy")
-        self.url     = url
-        self.table   = table
-        self.session = requests.Session()
-        self.session.headers.update(self.HEADERS)
-        self.rows_sent           = 0
-        self.errors              = 0
-        self._consecutive_errors = 0
-
-    def format(self, topo: dict, indices: np.ndarray,
-               counters: np.ndarray, ts_ns: int) -> bytes:
-        ts_ms     = ts_ns // 1_000_000
-        iface_idx = topo["iface_idx"]
-        qos_idx   = topo["qos_idx"]
-        dir_idx   = topo["dir_idx"]
-        all_ts: list[bytes] = []
-
-        for k, si in enumerate(indices):
-            ne_id     = int(iface_idx[si]) // 8
-            port      = int(iface_idx[si]) % 8
-            qos       = QOS_CLASSES[int(qos_idx[si])]
-            dirn      = DIRECTIONS[int(dir_idx[si])]
-            # Labels sorted: __name__ < direction < host < interface < qos_class
-            tag_labels = [
-                _label("direction", dirn),
-                _label("host",      f"NE{ne_id:05d}"),
-                _label("interface", f"GigabitEthernet{ne_id}/{port}"),
-                _label("qos_class", qos),
-            ]
-            for col_idx, col_name in enumerate(METRIC_COLS):
-                labels = [_label("__name__", f"{self.table}_{col_name}")] + tag_labels
-                all_ts.append(_timeseries(labels, _sample(float(counters[k, col_idx]), ts_ms)))
-
-        return _snappy.compress(_write_request(all_ts))
-
-    def send(self, payload: bytes) -> bool:
-        try:
-            r  = self.session.post(self.url, data=payload, timeout=30)
-            ok = r.status_code in (200, 204)
-            if ok:
-                self._consecutive_errors = 0
-                self.rows_sent += 1
-            else:
-                self.errors += 1
-                self._consecutive_errors += 1
-                if self.errors <= 3 or self.errors % 20 == 0:
-                    print(f"  [WARN] HTTP {r.status_code}: {r.text[:300]}")
-            return ok
-        except Exception as exc:
-            self.errors += 1
-            self._consecutive_errors += 1
-            if self.errors <= 3 or self.errors % 20 == 0:
-                print(f"  [ERR]  {exc}")
-            return False
-
-    @property
-    def too_many_errors(self) -> bool:
-        return self._consecutive_errors >= 10
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stream loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_stream(topo: dict, state: CounterState, writer: PrometheusWriter,
-               target_rate: float, duration_secs: int,
-               batch_size: int = 500) -> None:
-    n_series = topo["n_series"]
-    order    = topo["shuffle_order"]
+def run_stream(
+    topo: dict,
+    state: CounterState,
+    prom_counters: dict,
+    target_rate: float,
+    duration_secs: int,
+    batch_size: int = 500,
+) -> None:
+    n_series         = topo["n_series"]
+    order            = topo["shuffle_order"]
+    iface_idx        = topo["iface_idx"]
+    qos_idx          = topo["qos_idx"]
+    dir_idx          = topo["dir_idx"]
 
     ideal_batch_secs = batch_size / target_rate
     series_interval  = n_series  / target_rate
@@ -337,19 +219,16 @@ def run_stream(topo: dict, state: CounterState, writer: PrometheusWriter,
 
     print(f"\n{'─'*62}")
     print(f"  Series            : {n_series:,}")
-    print(f"  Target rate       : {target_rate:,.0f} rows/sec")
-    print(f"  Series revisit    : {series_interval:.1f} s  "
-          f"(vs {COLLECTION_INTERVAL} s collection interval)")
-    print(f"  Batch size        : {batch_size}  "
-          f"({batch_size * len(METRIC_COLS):,} samples/POST)")
+    print(f"  Update rate       : {target_rate:,.0f} series/sec")
+    print(f"  Series revisit    : {series_interval:.1f} s")
+    print(f"  Batch size        : {batch_size}")
     print(f"  Duration          : {'∞' if forever else f'{duration_secs} s'}")
-    print(f"  Metric prefix     : {writer.table}_*")
     print(f"{'─'*62}\n")
 
     wall_start       = time.monotonic()
     pointer          = 0
     lap              = 0
-    total_rows       = 0
+    total_series     = 0
     sleep_debt       = 0.0
     last_report_t    = wall_start
     last_report_rows = 0
@@ -369,14 +248,26 @@ def run_stream(topo: dict, state: CounterState, writer: PrometheusWriter,
             pointer = end - n_series
             lap    += 1
 
-        ts_ns    = int(time.time() * 1e9)
-        counters = state.advance_slice(indices, ts_ns / 1e9)
-        writer.send(writer.format(topo, indices, counters, ts_ns))
-        total_rows += len(indices)
+        ts_now = time.time()
+        deltas = state.advance_slice(indices, ts_now)
 
-        if writer.too_many_errors:
-            print("\n[FATAL] 10 consecutive send errors — aborting.")
-            break
+        # Increment prometheus_client counters for each series in the batch
+        for k, si in enumerate(indices):
+            ne_id = int(iface_idx[si]) // 8
+            port  = int(iface_idx[si]) % 8
+            host  = f"NE{ne_id:05d}"
+            iface = f"GigabitEthernet{ne_id}/{port}"
+            qos   = QOS_CLASSES[int(qos_idx[si])]
+            dirn  = DIRECTIONS[int(dir_idx[si])]
+
+            for col_idx, col_name in enumerate(METRIC_COLS):
+                delta = int(deltas[k, col_idx])
+                if delta > 0:
+                    prom_counters[col_name].labels(
+                        direction=dirn, host=host, interface=iface, qos_class=qos
+                    ).inc(delta)
+
+        total_series += len(indices)
 
         elapsed_batch = time.monotonic() - batch_start
         sleep_needed  = ideal_batch_secs - elapsed_batch - sleep_debt
@@ -389,24 +280,22 @@ def run_stream(topo: dict, state: CounterState, writer: PrometheusWriter,
         now = time.monotonic()
         if now - last_report_t >= 10.0:
             dt          = now - last_report_t
-            actual_rate = (total_rows - last_report_rows) / dt
+            actual_rate = (total_series - last_report_rows) / dt
             if forever:
                 progress = f"{now - wall_start:6.0f}s elapsed"
             else:
                 pct      = min(100.0, 100.0 * (now - wall_start) / duration_secs)
                 progress = f"[{pct:5.1f}%] {now - wall_start:6.0f}s"
-            print(f"  {progress}  rate={actual_rate:8,.0f} rows/sec  "
-                  f"sent={total_rows:,}  errors={writer.errors}  lap={lap}")
+            print(f"  {progress}  rate={actual_rate:8,.0f} series/sec  "
+                  f"updated={total_series:,}  lap={lap}")
             last_report_t    = now
-            last_report_rows = total_rows
+            last_report_rows = total_series
 
     wall_elapsed = time.monotonic() - wall_start
     print(f"\n{'═'*62}")
     print(f"  Elapsed           : {wall_elapsed:.1f} s")
-    print(f"  Rows emitted      : {total_rows:,}")
-    print(f"  Avg rate          : {total_rows / wall_elapsed:,.0f} rows/sec")
-    print(f"  Batches sent      : {writer.rows_sent}")
-    print(f"  Send errors       : {writer.errors}")
+    print(f"  Series updated    : {total_series:,}")
+    print(f"  Avg rate          : {total_series / wall_elapsed:,.0f} series/sec")
     print(f"  Full laps         : {lap}")
     print(f"{'═'*62}\n")
 
@@ -421,15 +310,14 @@ def _env_bool(key: str) -> bool:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DCM Traffic Generator — Prometheus remote write",
+        description="DCM Traffic Generator — Prometheus scrape endpoint",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument(
-        "--prometheus-url",
-        default=os.environ.get("PROMETHEUS_URL", ""),
-        metavar="URL",
-        help="Full remote write URL incl. auth params. Env: PROMETHEUS_URL",
+        "--port", type=int,
+        default=int(os.environ.get("PORT", "8000")),
+        help="HTTP port to expose /metrics on (default: %(default)s). Env: PORT",
     )
     p.add_argument(
         "--scale", type=float,
@@ -438,18 +326,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--duration", type=int,
-        default=int(os.environ.get("DURATION", "300")),
+        default=int(os.environ.get("DURATION", "0")),
         help="Run duration in seconds; 0 = run forever (default: %(default)s). Env: DURATION",
     )
     p.add_argument(
         "--rate", type=float,
         default=float(os.environ.get("RATE", "0")),
-        help="Rows/sec override; 0 = SCALE × 21,000 (default: %(default)s). Env: RATE",
+        help="Series updates/sec; 0 = auto from scale (default: %(default)s). Env: RATE",
     )
     p.add_argument(
         "--batch", type=int,
         default=int(os.environ.get("BATCH", "500")),
-        help="Rows per HTTP POST (default: %(default)s). Env: BATCH",
+        help="Series updated per tick (default: %(default)s). Env: BATCH",
     )
     p.add_argument(
         "--table",
@@ -461,57 +349,50 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SEED", "42")),
         help="Random seed (default: %(default)s). Env: SEED",
     )
-    p.add_argument(
-        "--no-ping", action="store_true",
-        default=_env_bool("NO_PING"),
-        help="Skip endpoint reachability check. Env: NO_PING",
-    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    if not args.prometheus_url:
-        sys.exit("ERROR: --prometheus-url (or PROMETHEUS_URL env var) is required.")
-
     n_interfaces = max(1, int(FULL_INTERFACES * args.scale))
     target_rate  = args.rate if args.rate > 0 else FULL_TARGET_RATE * args.scale
+    target_rate  = max(target_rate, 1.0)
 
-    n_series     = max(1, int(FULL_INTERFACES * args.scale)) * len(QOS_CLASSES) * len(DIRECTIONS)
-    revisit_secs = n_series / target_rate
-    min_duration = int(revisit_secs * 2)    # 2 laps minimum for rate() to work
+    n_series       = n_interfaces * len(QOS_CLASSES) * len(DIRECTIONS)
+    series_revisit = n_series / target_rate
 
-    print(f"\nDCM Traffic Generator")
+    print(f"\nDCM Traffic Generator  (scrape-endpoint mode)")
     print(f"  Scale            : {args.scale:.4f}  ({n_interfaces:,} interfaces)")
-    print(f"  Target rate      : {target_rate:,.0f} rows/sec")
     print(f"  Series           : {n_series:,}")
-    print(f"  Series revisit   : {revisit_secs:.0f} s")
-    dur_str = '∞' if args.duration <= 0 else f'{args.duration} s'
-    if 0 < args.duration < min_duration:
-        dur_str += f"  ⚠ too short — need ≥{min_duration} s for rate() graphs (2 full laps)"
-    print(f"  Duration         : {dur_str}")
+    print(f"  Update rate      : {target_rate:,.0f} series/sec")
+    print(f"  Series revisit   : {series_revisit:.0f} s")
+    print(f"  Duration         : {'∞' if args.duration <= 0 else f'{args.duration} s'}")
     print(f"  Metric prefix    : {args.table}_*")
-    print(f"  Endpoint         : {args.prometheus_url[:72]}{'…' if len(args.prometheus_url) > 72 else ''}")
+    print(f"  Scrape endpoint  : http://0.0.0.0:{args.port}/metrics")
 
-    writer = PrometheusWriter(args.prometheus_url, table=args.table)
+    # Create prometheus_client Counter objects (6 metrics, 4 labels each)
+    prom_counters = {}
+    for col in METRIC_COLS:
+        prom_counters[col] = Counter(
+            f"{args.table}_{col}",
+            f"DCM QoS counter: {col}",
+            LABEL_NAMES,
+        )
 
-    if not args.no_ping:
-        print(f"\nEndpoint reachability … SKIP  "
-              f"(Prometheus remote write has no standard /health)")
+    # Start the HTTP scrape endpoint
+    start_http_server(args.port)
+    print(f"\n[ready] /metrics listening on port {args.port}\n")
 
     topo  = build_topology(n_interfaces, seed=args.seed)
     state = CounterState(topo, seed=args.seed + 1)
 
-    max_batch  = max(1, int(target_rate * 5))
-    batch_size = min(args.batch, max_batch)
-    if batch_size != args.batch:
-        print(f"  [info] Batch clamped to {batch_size} (≤ 5 s worth at {target_rate:.0f} rows/sec)")
+    batch_size = args.batch
 
     run_stream(
         topo          = topo,
         state         = state,
-        writer        = writer,
+        prom_counters = prom_counters,
         target_rate   = target_rate,
         duration_secs = args.duration,
         batch_size    = batch_size,

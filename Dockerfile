@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="DCM Traffic Generator" \
-      org.opencontainers.image.description="Constant-stream telemetry generator via Prometheus remote write" \
+      org.opencontainers.image.description="Constant-stream telemetry generator, Prometheus scrape endpoint" \
       org.opencontainers.image.source="https://github.com/ys1173/dcm-traffic-gen" \
       org.opencontainers.image.licenses="MIT"
 

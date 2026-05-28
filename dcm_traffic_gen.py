@@ -4,25 +4,21 @@ dcm_traffic_gen.py — DCM Traffic Generator (Prometheus scrape-endpoint mode)
 
 Exposes QoS counter metrics on a /metrics HTTP endpoint for scraping by any
 Prometheus-compatible collector (FFWD Universal Collector, Prometheus,
-Grafana Agent, etc.).
+Grafana Agent, Vector, etc.).
 
-Models a fleet of network interfaces (1–400 Gbps), 8 QoS traffic classes,
-2 directions, and 6 counter columns per series — with realistic sparsity,
-diurnal load variation, and ±3 % traffic noise.
+The /metrics response is pre-rendered in a background thread so the HTTP
+handler always returns instantly — scrape timeouts are never hit regardless
+of scale.
 
 ─────────────────────────────────────────────────────────────────────────────
-USAGE (Docker — recommended)
+USAGE (Docker)
 ─────────────────────────────────────────────────────────────────────────────
-    docker run --rm -p 8000:8000 \\
-      -e SCALE=0.01 \\
-      ghcr.io/ys1173/dcm-traffic-gen:latest
+    docker run --rm -p 8000:8000 -e SCALE=0.01 ghcr.io/ys1173/dcm-traffic-gen:latest
 
 ─────────────────────────────────────────────────────────────────────────────
 USAGE (CLI)
 ─────────────────────────────────────────────────────────────────────────────
     python dcm_traffic_gen.py --scale 0.01
-
-Point your collector at:  http://<host>:8000/metrics
 
 ─────────────────────────────────────────────────────────────────────────────
 ENVIRONMENT VARIABLES
@@ -33,22 +29,14 @@ ENVIRONMENT VARIABLES
   RATE        Series updates/sec; 0 = auto              (default: 0)
   BATCH       Series updated per tick                   (default: 500)
   TABLE       Metric name prefix                        (default: dcm_telemetry)
-  SEED        Topology random seed (reproducibility)    (default: 42)
-
-─────────────────────────────────────────────────────────────────────────────
-SCALE MAP  (250 K interfaces × 8 QoS × 2 directions)
-─────────────────────────────────────────────────────────────────────────────
-  SCALE=0.001  →    250 interfaces,    4,000 series
-  SCALE=0.01   →  2,500 interfaces,   40,000 series
-  SCALE=0.10   → 25,000 interfaces,  400,000 series
-  SCALE=1.00   →250,000 interfaces,4,000,000 series
+  SEED        Topology random seed                      (default: 42)
 
 ─────────────────────────────────────────────────────────────────────────────
 METRICS EMITTED  (6 per series, TYPE counter)
 ─────────────────────────────────────────────────────────────────────────────
-  <TABLE>_match_bytes     <TABLE>_match_packets
-  <TABLE>_trans_bytes     <TABLE>_trans_packets
-  <TABLE>_drop_bytes      <TABLE>_drop_packets
+  <TABLE>_match_bytes_total     <TABLE>_match_packets_total
+  <TABLE>_trans_bytes_total     <TABLE>_trans_packets_total
+  <TABLE>_drop_bytes_total      <TABLE>_drop_packets_total
 
   Labels: direction, host, interface, qos_class
 """
@@ -56,13 +44,15 @@ METRICS EMITTED  (6 per series, TYPE counter)
 from __future__ import annotations
 
 import argparse
+import gzip
+import http.server
+import io
 import math
 import os
-import sys
+import threading
 import time
 
 import numpy as np
-from prometheus_client import Counter, start_http_server
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,20 +62,12 @@ from prometheus_client import Counter, start_http_server
 FULL_INTERFACES  = 250_000
 FULL_TARGET_RATE = 21_000          # series/sec at scale 1.0
 
-QOS_CLASSES = [
-    "TC1", "TC2", "TC3", "TC4", "TC5", "TC6", "TC7", "class-default"
-]
-DIRECTIONS = ["input", "output"]
+QOS_CLASSES = ["TC1", "TC2", "TC3", "TC4", "TC5", "TC6", "TC7", "class-default"]
+DIRECTIONS  = ["input", "output"]
 
 QOS_SPARSITY = {
-    "TC1":           0.05,
-    "TC2":           0.02,
-    "TC3":           0.10,
-    "TC4":           0.72,
-    "TC5":           0.73,
-    "TC6":           0.15,
-    "TC7":           0.20,
-    "class-default": 0.01,
+    "TC1": 0.05, "TC2": 0.02, "TC3": 0.10, "TC4": 0.72,
+    "TC5": 0.73, "TC6": 0.15, "TC7": 0.20, "class-default": 0.01,
 }
 
 QOS_SPLIT = np.array([0.30, 0.25, 0.15, 0.10, 0.05, 0.08, 0.05, 0.02],
@@ -105,8 +87,7 @@ METRIC_COLS = [
 ]
 
 COLLECTION_INTERVAL = 300   # seconds (simulated router polling interval)
-
-LABEL_NAMES = ["direction", "host", "interface", "qos_class"]
+RENDER_INTERVAL     = 30    # seconds between background buffer re-renders
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -151,25 +132,25 @@ def build_topology(n_interfaces: int, seed: int = 42) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CounterState:
-    """Tracks per-series traffic state; returns deltas on each visit."""
+    """Tracks per-series cumulative counters, advanced on each visit."""
 
     def __init__(self, topo: dict, seed: int = 1):
-        n           = topo["n_series"]
-        self.topo   = topo
-        self.rng    = np.random.default_rng(seed)
-        # Seed last_ts one full collection interval in the past so the very
-        # first visit yields a realistic non-zero delta (≈ 5 min of traffic).
-        self.last_ts = np.full(n, time.time() - COLLECTION_INTERVAL,
-                               dtype=np.float64)
+        n             = topo["n_series"]
+        self.topo     = topo
+        self.rng      = np.random.default_rng(seed)
+        self.cumulative = np.zeros((n, 6), dtype=np.uint64)
+        # Bootstrap one full collection interval in the past so the first
+        # visit to every series yields a realistic non-zero delta.
+        self.last_ts  = np.full(n, time.time() - COLLECTION_INTERVAL,
+                                dtype=np.float64)
 
     @staticmethod
     def diurnal_factor(ts: float) -> float:
-        hour   = (ts / 3600 + 9) % 24
-        factor = 0.65 + 0.35 * math.sin(math.pi * (hour - 4) / 20)
-        return max(0.30, min(1.00, factor))
+        hour = (ts / 3600 + 9) % 24
+        return max(0.30, min(1.00, 0.65 + 0.35 * math.sin(math.pi * (hour - 4) / 20)))
 
-    def advance_slice(self, indices: np.ndarray, ts_now: float) -> np.ndarray:
-        """Return per-series deltas (shape: len(indices) × 6) and update state."""
+    def advance_slice(self, indices: np.ndarray, ts_now: float) -> None:
+        """Advance counters for the given series indices (updates cumulative in-place)."""
         rng     = self.rng
         n       = len(indices)
         elapsed = np.maximum(ts_now - self.last_ts[indices], 0.0)
@@ -190,54 +171,220 @@ class CounterState:
         drop_b    = byte_delta - trans_b
         drop_p    = pkt_delta  - trans_p
 
-        return np.stack(
+        deltas = np.stack(
             [pkt_delta, byte_delta, trans_p, trans_b, drop_p, drop_b], axis=1
         ).astype(np.uint64)
+        self.cumulative[indices] += deltas
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Update loop
+# Pre-rendered metrics buffer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MetricsBuffer:
+    """
+    Thread-safe holder for a pre-rendered, gzip-compressed /metrics payload.
+
+    The HTTP handler reads from here (instant), while a background thread
+    updates the buffer asynchronously — scrape timeouts are never hit.
+    """
+
+    def __init__(self) -> None:
+        self._lock        = threading.Lock()
+        self._plain: bytes = b"# initialising...\n"
+        self._gz: bytes    = gzip.compress(self._plain, compresslevel=1)
+        self._rendered_at  = 0.0
+
+    def update(self, plain: bytes) -> None:
+        gz = gzip.compress(plain, compresslevel=1)
+        with self._lock:
+            self._plain       = plain
+            self._gz          = gz
+            self._rendered_at = time.time()
+
+    def get(self, want_gz: bool) -> tuple[bytes, bool]:
+        with self._lock:
+            return (self._gz, True) if want_gz else (self._plain, False)
+
+    @property
+    def age_secs(self) -> float:
+        return time.time() - self._rendered_at
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Label prefix pre-computation and fast rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_label_prefixes(topo: dict, table: str) -> tuple[bytes, list[bytes]]:
+    """
+    Pre-compute static label prefix bytes for every series.
+
+    Returns:
+        headers  – HELP/TYPE block bytes for all 6 metrics
+        label_bytes – per-series label bytes (reused across all 6 metrics)
+                      e.g. b'direction="input",host="NE00001",...'
+    """
+    iface_idx = topo["iface_idx"]
+    qos_idx   = topo["qos_idx"]
+    dir_idx   = topo["dir_idx"]
+    n         = topo["n_series"]
+
+    # Build HELP/TYPE headers
+    hdr = io.BytesIO()
+    for col in METRIC_COLS:
+        mname = f"{table}_{col}_total"
+        hdr.write(f"# HELP {mname} DCM QoS counter: {col}\n".encode())
+        hdr.write(f"# TYPE {mname} counter\n".encode())
+    headers = hdr.getvalue()
+
+    # Pre-compute per-series label block (metric-name-agnostic)
+    print(f"  Building label prefix map for {n:,} series …", end="", flush=True)
+    t0 = time.monotonic()
+    label_bytes: list[bytes] = []
+    for si in range(n):
+        ne_id = int(iface_idx[si]) // 8
+        port  = int(iface_idx[si]) % 8
+        qos   = QOS_CLASSES[int(qos_idx[si])]
+        dirn  = DIRECTIONS[int(dir_idx[si])]
+        label_bytes.append(
+            f'direction="{dirn}",host="NE{ne_id:05d}",'
+            f'interface="GigabitEthernet{ne_id}/{port}",'
+            f'qos_class="{qos}"'.encode()
+        )
+    print(f" done ({time.monotonic() - t0:.1f}s)")
+    return headers, label_bytes
+
+
+def render_metrics(topo: dict, snap: np.ndarray,
+                   headers: bytes, label_bytes: list[bytes],
+                   table: str) -> bytes:
+    """
+    Fast render of the full Prometheus text payload.
+
+    Uses pre-computed per-series label bytes and list-comprehension joins
+    to minimise Python overhead per line.
+    """
+    n   = topo["n_series"]
+    buf = io.BytesIO()
+    buf.write(headers)
+
+    # Convert numpy array to Python list once for fast scalar access
+    vals = snap.tolist()   # list[list[int]], shape (n, 6)
+
+    for col_idx, col in enumerate(METRIC_COLS):
+        mname_b = f"{table}_{col}_total{{".encode()
+        closing = b"} "
+        nl      = b"\n"
+        # list-comprehension + single join: fastest pure-Python bulk string build
+        chunk = b"".join(
+            mname_b + label_bytes[si] + closing
+            + str(vals[si][col_idx]).encode() + nl
+            for si in range(n)
+        )
+        buf.write(chunk)
+
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP server  (instant response from pre-built buffer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def start_http_server(port: int, mbuf: MetricsBuffer) -> http.server.HTTPServer:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path not in ("/metrics", "/"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            want_gz    = "gzip" in self.headers.get("Accept-Encoding", "")
+            data, is_gz = mbuf.get(want_gz)
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "text/plain; version=0.0.4; charset=utf-8")
+            if is_gz:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_) -> None:
+            pass  # suppress per-request logs
+
+    srv = http.server.ThreadingHTTPServer(("", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Update + render loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_stream(
     topo: dict,
     state: CounterState,
-    prom_counters: dict,
+    mbuf: MetricsBuffer,
+    headers: bytes,
+    label_bytes: list[bytes],
+    table: str,
     target_rate: float,
     duration_secs: int,
-    batch_size: int = 500,
+    batch_size: int,
 ) -> None:
     n_series         = topo["n_series"]
     order            = topo["shuffle_order"]
-    iface_idx        = topo["iface_idx"]
-    qos_idx          = topo["qos_idx"]
-    dir_idx          = topo["dir_idx"]
-
     ideal_batch_secs = batch_size / target_rate
-    series_interval  = n_series  / target_rate
+    series_interval  = n_series / target_rate
     forever          = duration_secs <= 0
+
+    # Render flag prevents concurrent renders if one is still running
+    _rendering = threading.Event()
+
+    def do_render(snap: np.ndarray) -> None:
+        t0    = time.monotonic()
+        plain = render_metrics(topo, snap, headers, label_bytes, table)
+        mbuf.update(plain)
+        elapsed  = time.monotonic() - t0
+        plain_mb = len(plain) / 1e6
+        gz_mb    = len(mbuf.get(True)[0]) / 1e6
+        print(f"  [render] {plain_mb:.1f} MB plain → {gz_mb:.1f} MB gzip  "
+              f"({elapsed:.1f}s)  buf_age={mbuf.age_secs:.0f}s")
+        _rendering.clear()
+
+    def trigger_render() -> None:
+        if not _rendering.is_set():
+            _rendering.set()
+            snap = state.cumulative.copy()
+            threading.Thread(target=do_render, args=(snap,), daemon=True).start()
+
+    # Initial render so first scrape gets real data
+    print("  [render] building initial metrics buffer …")
+    do_render(state.cumulative.copy())
 
     print(f"\n{'─'*62}")
     print(f"  Series            : {n_series:,}")
     print(f"  Update rate       : {target_rate:,.0f} series/sec")
     print(f"  Series revisit    : {series_interval:.1f} s")
+    print(f"  Buffer refresh    : every ~{RENDER_INTERVAL}s or each full lap")
     print(f"  Batch size        : {batch_size}")
     print(f"  Duration          : {'∞' if forever else f'{duration_secs} s'}")
     print(f"{'─'*62}\n")
 
-    wall_start       = time.monotonic()
-    pointer          = 0
-    lap              = 0
-    total_series     = 0
-    sleep_debt       = 0.0
-    last_report_t    = wall_start
-    last_report_rows = 0
+    wall_start    = time.monotonic()
+    pointer       = 0
+    lap           = 0
+    total_series  = 0
+    sleep_debt    = 0.0
+    last_report_t = wall_start
+    last_report_n = 0
+    last_render_t = wall_start
 
     while True:
         now = time.monotonic()
         if not forever and now >= wall_start + duration_secs:
             break
 
+        # Build batch
         batch_start = now
         end = pointer + batch_size
         if end <= n_series:
@@ -247,28 +394,18 @@ def run_stream(
             indices = np.concatenate([order[pointer:], order[:end - n_series]])
             pointer = end - n_series
             lap    += 1
+            trigger_render()   # re-render after each full lap
 
-        ts_now = time.time()
-        deltas = state.advance_slice(indices, ts_now)
-
-        # Increment prometheus_client counters for each series in the batch
-        for k, si in enumerate(indices):
-            ne_id = int(iface_idx[si]) // 8
-            port  = int(iface_idx[si]) % 8
-            host  = f"NE{ne_id:05d}"
-            iface = f"GigabitEthernet{ne_id}/{port}"
-            qos   = QOS_CLASSES[int(qos_idx[si])]
-            dirn  = DIRECTIONS[int(dir_idx[si])]
-
-            for col_idx, col_name in enumerate(METRIC_COLS):
-                delta = int(deltas[k, col_idx])
-                if delta > 0:
-                    prom_counters[col_name].labels(
-                        direction=dirn, host=host, interface=iface, qos_class=qos
-                    ).inc(delta)
-
+        state.advance_slice(indices, time.time())
         total_series += len(indices)
 
+        # Also re-render every RENDER_INTERVAL seconds (first lap at large scales)
+        now = time.monotonic()
+        if now - last_render_t >= RENDER_INTERVAL:
+            trigger_render()
+            last_render_t = now
+
+        # Pace to target rate
         elapsed_batch = time.monotonic() - batch_start
         sleep_needed  = ideal_batch_secs - elapsed_batch - sleep_debt
         if sleep_needed > 0.0002:
@@ -277,19 +414,20 @@ def run_stream(
         else:
             sleep_debt = max(0.0, -sleep_needed)
 
+        # Progress report every 10s
         now = time.monotonic()
         if now - last_report_t >= 10.0:
-            dt          = now - last_report_t
-            actual_rate = (total_series - last_report_rows) / dt
+            dt   = now - last_report_t
+            rate = (total_series - last_report_n) / dt
             if forever:
                 progress = f"{now - wall_start:6.0f}s elapsed"
             else:
                 pct      = min(100.0, 100.0 * (now - wall_start) / duration_secs)
                 progress = f"[{pct:5.1f}%] {now - wall_start:6.0f}s"
-            print(f"  {progress}  rate={actual_rate:8,.0f} series/sec  "
-                  f"updated={total_series:,}  lap={lap}")
-            last_report_t    = now
-            last_report_rows = total_series
+            print(f"  {progress}  rate={rate:8,.0f} series/sec  "
+                  f"updated={total_series:,}  lap={lap}  buf_age={mbuf.age_secs:.0f}s")
+            last_report_t = now
+            last_report_n = total_series
 
     wall_elapsed = time.monotonic() - wall_start
     print(f"\n{'═'*62}")
@@ -304,61 +442,27 @@ def run_stream(
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _env_bool(key: str) -> bool:
-    return os.environ.get(key, "").lower() in ("1", "true", "yes")
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="DCM Traffic Generator — Prometheus scrape endpoint",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument(
-        "--port", type=int,
-        default=int(os.environ.get("PORT", "8000")),
-        help="HTTP port to expose /metrics on (default: %(default)s). Env: PORT",
-    )
-    p.add_argument(
-        "--scale", type=float,
-        default=float(os.environ.get("SCALE", "0.01")),
-        help="Fraction of full workload (default: %(default)s). Env: SCALE",
-    )
-    p.add_argument(
-        "--duration", type=int,
-        default=int(os.environ.get("DURATION", "0")),
-        help="Run duration in seconds; 0 = run forever (default: %(default)s). Env: DURATION",
-    )
-    p.add_argument(
-        "--rate", type=float,
-        default=float(os.environ.get("RATE", "0")),
-        help="Series updates/sec; 0 = auto from scale (default: %(default)s). Env: RATE",
-    )
-    p.add_argument(
-        "--batch", type=int,
-        default=int(os.environ.get("BATCH", "500")),
-        help="Series updated per tick (default: %(default)s). Env: BATCH",
-    )
-    p.add_argument(
-        "--table",
-        default=os.environ.get("TABLE", "dcm_telemetry"),
-        help="Metric name prefix (default: %(default)s). Env: TABLE",
-    )
-    p.add_argument(
-        "--seed", type=int,
-        default=int(os.environ.get("SEED", "42")),
-        help="Random seed (default: %(default)s). Env: SEED",
-    )
+    p.add_argument("--port",     type=int,   default=int(os.environ.get("PORT",     "8000")))
+    p.add_argument("--scale",    type=float, default=float(os.environ.get("SCALE",  "0.01")))
+    p.add_argument("--duration", type=int,   default=int(os.environ.get("DURATION", "0")))
+    p.add_argument("--rate",     type=float, default=float(os.environ.get("RATE",   "0")))
+    p.add_argument("--batch",    type=int,   default=int(os.environ.get("BATCH",    "500")))
+    p.add_argument("--table",    default=os.environ.get("TABLE", "dcm_telemetry"))
+    p.add_argument("--seed",     type=int,   default=int(os.environ.get("SEED",     "42")))
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    n_interfaces = max(1, int(FULL_INTERFACES * args.scale))
-    target_rate  = args.rate if args.rate > 0 else FULL_TARGET_RATE * args.scale
-    target_rate  = max(target_rate, 1.0)
-
+    n_interfaces   = max(1, int(FULL_INTERFACES * args.scale))
+    target_rate    = max(args.rate if args.rate > 0 else FULL_TARGET_RATE * args.scale, 1.0)
     n_series       = n_interfaces * len(QOS_CLASSES) * len(DIRECTIONS)
     series_revisit = n_series / target_rate
 
@@ -370,32 +474,27 @@ def main() -> None:
     print(f"  Duration         : {'∞' if args.duration <= 0 else f'{args.duration} s'}")
     print(f"  Metric prefix    : {args.table}_*")
     print(f"  Scrape endpoint  : http://0.0.0.0:{args.port}/metrics")
-
-    # Create prometheus_client Counter objects (6 metrics, 4 labels each)
-    prom_counters = {}
-    for col in METRIC_COLS:
-        prom_counters[col] = Counter(
-            f"{args.table}_{col}",
-            f"DCM QoS counter: {col}",
-            LABEL_NAMES,
-        )
-
-    # Start the HTTP scrape endpoint
-    start_http_server(args.port)
-    print(f"\n[ready] /metrics listening on port {args.port}\n")
+    print()
 
     topo  = build_topology(n_interfaces, seed=args.seed)
     state = CounterState(topo, seed=args.seed + 1)
 
-    batch_size = args.batch
+    headers, label_bytes = build_label_prefixes(topo, args.table)
+
+    mbuf = MetricsBuffer()
+    start_http_server(args.port, mbuf)
+    print(f"\n[ready] /metrics listening on port {args.port}\n")
 
     run_stream(
         topo          = topo,
         state         = state,
-        prom_counters = prom_counters,
+        mbuf          = mbuf,
+        headers       = headers,
+        label_bytes   = label_bytes,
+        table         = args.table,
         target_rate   = target_rate,
         duration_secs = args.duration,
-        batch_size    = batch_size,
+        batch_size    = args.batch,
     )
 
 

@@ -255,14 +255,18 @@ def build_label_prefixes(topo: dict, table: str) -> tuple[bytes, list[bytes]]:
     return headers, label_bytes
 
 
+_RENDER_CHUNK = 2_000   # series per join chunk — keeps GIL blocks <5 ms
+
+
 def render_metrics(topo: dict, snap: np.ndarray,
                    headers: bytes, label_bytes: list[bytes],
                    table: str) -> bytes:
     """
-    Fast render of the full Prometheus text payload.
+    Render the full Prometheus text payload.
 
-    Uses pre-computed per-series label bytes and list-comprehension joins
-    to minimise Python overhead per line.
+    Processes series in small chunks (_RENDER_CHUNK) so each C-level
+    bytes.join() holds the GIL for only a few milliseconds, keeping the
+    HTTP server thread responsive throughout the render.
     """
     n   = topo["n_series"]
     buf = io.BytesIO()
@@ -275,13 +279,14 @@ def render_metrics(topo: dict, snap: np.ndarray,
         mname_b = f"{table}_{col}_total{{".encode()
         closing = b"} "
         nl      = b"\n"
-        # list-comprehension + single join: fastest pure-Python bulk string build
-        chunk = b"".join(
-            mname_b + label_bytes[si] + closing
-            + str(vals[si][col_idx]).encode() + nl
-            for si in range(n)
-        )
-        buf.write(chunk)
+        for start in range(0, n, _RENDER_CHUNK):
+            end = min(start + _RENDER_CHUNK, n)
+            buf.write(b"".join(
+                mname_b + label_bytes[si] + closing
+                + str(vals[si][col_idx]).encode() + nl
+                for si in range(start, end)
+            ))
+            time.sleep(0)   # yield GIL so HTTP thread can respond
 
     return buf.getvalue()
 
@@ -297,13 +302,14 @@ def start_http_server(port: int, mbuf: MetricsBuffer) -> http.server.HTTPServer:
                 self.send_response(404)
                 self.end_headers()
                 return
-            want_gz    = "gzip" in self.headers.get("Accept-Encoding", "")
-            data, is_gz = mbuf.get(want_gz)
+            # Always serve the pre-gzipped buffer — reduces 120 MB to ~10 MB
+            # regardless of whether the client advertises Accept-Encoding: gzip.
+            # All modern Prometheus-compatible collectors handle gzip responses.
+            data, _ = mbuf.get(want_gz=True)
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/plain; version=0.0.4; charset=utf-8")
-            if is_gz:
-                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)

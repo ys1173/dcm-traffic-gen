@@ -13,6 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY dcm_traffic_gen.py .
 
 # ── Config — all overridable at docker run with -e ────────────────────────────
+# Common
+ENV MODE=scrape
 ENV PORT=8000
 ENV SCALE=0.01
 ENV DURATION=0
@@ -20,6 +22,11 @@ ENV RATE=0
 ENV BATCH=500
 ENV TABLE=dcm_telemetry
 ENV SEED=42
+# OTLP mode
+ENV OTLP_ENDPOINT=localhost:4317
+ENV OTLP_INTERVAL=30
+ENV OTLP_INSECURE=true
+ENV OTLP_BATCH=5000
 
 EXPOSE 8000
 

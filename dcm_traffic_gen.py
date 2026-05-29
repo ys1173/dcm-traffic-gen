@@ -302,14 +302,17 @@ def start_http_server(port: int, mbuf: MetricsBuffer) -> http.server.HTTPServer:
                 self.send_response(404)
                 self.end_headers()
                 return
-            # Always serve the pre-gzipped buffer — reduces 120 MB to ~10 MB
-            # regardless of whether the client advertises Accept-Encoding: gzip.
-            # All modern Prometheus-compatible collectors handle gzip responses.
-            data, _ = mbuf.get(want_gz=True)
+            # Serve gzip only when the client advertises Accept-Encoding: gzip.
+            # The buffer is always pre-built so the HTTP thread never blocks —
+            # even plain-text (288 MB at scale=0.1) transfers in ~2s at LAN speeds.
+            ae = self.headers.get("Accept-Encoding", "")
+            want_gz = "gzip" in ae
+            data, is_gz = mbuf.get(want_gz=want_gz)
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/plain; version=0.0.4; charset=utf-8")
-            self.send_header("Content-Encoding", "gzip")
+            if is_gz:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
